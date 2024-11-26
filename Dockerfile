@@ -1,16 +1,104 @@
-FROM amazoncorretto:17-alpine
+pipeline {
+    agent any
 
-ARG JAR_FILE=target/paymybuddy.jar
+    environment {
+        DOCKERHUB_AUTH = credentials('DockerHubCredentials')
+        MYSQL_AUTH = credentials('MYSQL_AUTH')
+        HOSTNAME_DEPLOY_PROD = "20.115.44.142"
+        HOSTNAME_DEPLOY_STAGING = "20.115.42.32"
+        IMAGE_NAME = 'paymybuddy'
+        IMAGE_TAG = 'latest'
+    }
 
-WORKDIR /app
+    stages {
+        stage('Build and Test') {
+            steps {
+                sh 'mvn clean test'
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
+                }
+            }
+        }
 
-COPY ${JAR_FILE} paymybuddy.jar
+        stage('SonarCloud Analysis') {
+            steps {
+                withSonarQubeEnv('SonarCloudServer') {
+                    sh 'mvn sonar:sonar -s .m2/settings.xml'
+                }
+            }
+        }
 
-ENV SPRING_DATASOURCE_USERNAME=root
+        stage('Package') {
+            steps {
+                sh 'mvn clean package -DskipTests'
+            }
+        }
 
-ENV SPRING_DATASOURCE_PASSWORD=password
+        stage('Build and Push Docker Image') {
+            steps {
+                sh """
+                    docker build -t ${DOCKERHUB_AUTH_USR}/${IMAGE_NAME}:${IMAGE_TAG} .
+                    echo ${DOCKERHUB_AUTH_PSW} | docker login -u ${DOCKERHUB_AUTH_USR} --password-stdin
+                    docker push ${DOCKERHUB_AUTH_USR}/${IMAGE_NAME}:${IMAGE_TAG}
+                """
+            }
+        }
 
-ENV SPRING_DATASOURCE_URL=jdbc:mysql://172.17.0.1:3306/db_paymybuddy
+        stage('Deploy Staging') {
+            when {
+                expression { env.GIT_BRANCH == 'origin/main' }
+            }
+            steps {
+                sshagent(credentials: ['SSH_AUTH_SERVER']) {
+                    sh '''
+                        ssh-keyscan -t rsa,dsa ${HOSTNAME_DEPLOY_STAGING} >> ~/.ssh/known_hosts
+                        scp -r deploy centos@${HOSTNAME_DEPLOY_STAGING}:/home/centos/
+                        ssh centos@${HOSTNAME_DEPLOY_STAGING} "
+                            cd deploy &&
+                            echo ${DOCKERHUB_AUTH_PSW} | docker login -u ${DOCKERHUB_AUTH_USR} --password-stdin &&
+                            docker compose down &&
+                            docker pull ${DOCKERHUB_AUTH_USR}/${IMAGE_NAME}:${IMAGE_TAG} &&
+                            docker compose up -d
+                        "
+                    '''
+                }
+            }
+        }
 
+        stage('Test Staging') {
+            steps {
+                sh 'curl ${HOSTNAME_DEPLOY_STAGING}:8080'
+            }
+        }
 
-CMD ["java", "-jar" , "paymybuddy.jar"]
+        stage('Deploy Production') {
+            when {
+                expression { env.GIT_BRANCH == 'origin/main' }
+            }
+            steps {
+                sshagent(credentials: ['SSH_AUTH_SERVER']) {
+                    sh '''
+                        ssh-keyscan -t rsa,dsa ${HOSTNAME_DEPLOY_PROD} >> ~/.ssh/known_hosts
+                        scp -r deploy centos@${HOSTNAME_DEPLOY_PROD}:/home/centos/
+                        ssh centos@${HOSTNAME_DEPLOY_PROD} "
+                            cd deploy &&
+                            echo ${DOCKERHUB_AUTH_PSW} | docker login -u ${DOCKERHUB_AUTH_USR} --password-stdin &&
+                            docker compose down &&
+                            docker pull ${DOCKERHUB_AUTH_USR}/${IMAGE_NAME}:${IMAGE_TAG} &&
+                            docker compose up -d
+                        "
+                    '''
+                }
+            }
+        }
+
+        stage('Test Production') {
+            steps {
+                sh 'curl ${HOSTNAME_DEPLOY_PROD}:8080'
+            }
+        }
+    }
+}
+
